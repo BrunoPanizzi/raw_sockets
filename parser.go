@@ -1,221 +1,243 @@
+// parser.go
 package main
 
 import (
-	"encoding/hex"
+	"encoding/binary"
+	"errors"
 	"fmt"
-	"log"
 	"net"
-	"strings"
+	"time"
 )
 
-type EthernetFrame struct {
-	DestinationMAC [6]byte
-	SourceMAC      [6]byte
-	EtherType      uint16
+var ErrTooShort = errors.New("buffer muito curto para parsear")
+
+type Packet struct {
+	Timestamp time.Time
+	IfName    string
+	Raw       []byte
+
+	DstMAC    net.HardwareAddr
+	SrcMAC    net.HardwareAddr
+	EtherType uint16
+
+	IsIPv4 bool
+	IPv4   *IPv4Header
+
+	TCP  *TCPHeader
+	UDP  *UDPHeader
+	ICMP *ICMPHeader
 }
 
-type IPV4Packet struct {
-	Version       uint8
-	IHL           uint8
-	TotalLength   uint16
-	Protocol      uint16
-	SourceIP      net.IP
-	DestinationIP net.IP
-	Payload       []byte
+type IPv4Header struct {
+	Version   uint8
+	IHL       uint8
+	TOS       uint8
+	TotalLen  uint16
+	ID        uint16
+	FlagsFrag uint16
+	TTL       uint8
+	Protocol  uint8
+	Checksum  uint16
+	SrcIP     net.IP
+	DstIP     net.IP
+	Payload   []byte
 }
 
 type UDPHeader struct {
-	SourcePort      uint16
-	DestinationPort uint16
-	Length          uint16
-	Checksum        uint16
+	SrcPort  uint16
+	DstPort  uint16
+	Length   uint16
+	Checksum uint16
+	Payload  []byte
 }
 
-func ParseEthernetFrame(data []byte) (*EthernetFrame, []byte) {
-	f := &EthernetFrame{
-		DestinationMAC: [6]byte{data[0], data[1], data[2], data[3], data[4], data[5]},
-		SourceMAC:      [6]byte{data[6], data[7], data[8], data[9], data[10], data[11]},
-		EtherType:      uint16(data[12])<<8 | uint16(data[13]),
+type TCPHeader struct {
+	SrcPort    uint16
+	DstPort    uint16
+	Seq        uint32
+	Ack        uint32
+	DataOffset uint8
+	Flags      uint16
+	Window     uint16
+	Checksum   uint16
+	Urgent     uint16
+	Payload    []byte
+}
+
+type ICMPHeader struct {
+	Type     uint8
+	Code     uint8
+	Checksum uint16
+	Rest     []byte
+}
+
+func ParseEthernet(data []byte, p *Packet) (int, error) {
+	if len(data) < 14 {
+		return 0, ErrTooShort
 	}
-	return f, data[14:]
+	p.DstMAC = net.HardwareAddr(data[0:6])
+	p.SrcMAC = net.HardwareAddr(data[6:12])
+	p.EtherType = binary.BigEndian.Uint16(data[12:14])
+	return 14, nil
 }
 
-func ParseIPv4Packet(data []byte) (*IPV4Packet, []byte) {
-	version := data[0] >> 4
-	ihl := data[0] & 0x0F
-	headerLength := int(ihl * 4)
-
-	p := &IPV4Packet{
-		Version:       version,
-		IHL:           ihl,
-		TotalLength:   uint16(data[2])<<8 | uint16(data[3]),
-		Protocol:      uint16(data[9]),
-		SourceIP:      net.IPv4(data[12], data[13], data[14], data[15]),
-		DestinationIP: net.IPv4(data[16], data[17], data[18], data[19]),
+func ParseIPv4(data []byte, p *Packet) (int, error) {
+	if len(data) < 20 {
+		return 0, ErrTooShort
+	}
+	versionIhl := data[0]
+	version := versionIhl >> 4
+	ihl := versionIhl & 0x0F
+	headerLen := int(ihl) * 4
+	if version != 4 || headerLen < 20 {
+		return 0, fmt.Errorf("não é um cabeçalho IPv4 válido")
+	}
+	if len(data) < headerLen {
+		return 0, ErrTooShort
+	}
+	totalLen := int(binary.BigEndian.Uint16(data[2:4]))
+	if totalLen > len(data) {
+		totalLen = len(data)
+	}
+	ip := &IPv4Header{
+		Version:   version,
+		IHL:       ihl,
+		TOS:       data[1],
+		TotalLen:  uint16(totalLen),
+		ID:        binary.BigEndian.Uint16(data[4:6]),
+		FlagsFrag: binary.BigEndian.Uint16(data[6:8]),
+		TTL:       data[8],
+		Protocol:  data[9],
+		Checksum:  binary.BigEndian.Uint16(data[10:12]),
+		SrcIP:     net.IPv4(data[12], data[13], data[14], data[15]),
+		DstIP:     net.IPv4(data[16], data[17], data[18], data[19]),
 	}
 
-	payloadStart := headerLength
-	p.Payload = data[payloadStart:p.TotalLength]
-
-	return p, data[p.TotalLength:]
-}
-
-func ParseUDP(data []byte) *UDPHeader {
-	return &UDPHeader{
-		SourcePort:      uint16(data[0])<<8 | uint16(data[1]),
-		DestinationPort: uint16(data[2])<<8 | uint16(data[3]),
-		Length:          uint16(data[4])<<8 | uint16(data[5]),
-		Checksum:        uint16(data[6])<<8 | uint16(data[7]),
+	payloadStart := headerLen
+	if totalLen > payloadStart {
+		ip.Payload = data[payloadStart:totalLen]
+	} else {
+		ip.Payload = []byte{}
 	}
+
+	p.IsIPv4 = true
+	p.IPv4 = ip
+	return totalLen, nil
 }
 
-func formatMACBytes(b [6]byte) string {
-	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
-		b[0], b[1], b[2], b[3], b[4], b[5])
+func ParseUDPHeader(b []byte) (*UDPHeader, error) {
+	if len(b) < 8 {
+		return nil, ErrTooShort
+	}
+	h := &UDPHeader{
+		SrcPort:  binary.BigEndian.Uint16(b[0:2]),
+		DstPort:  binary.BigEndian.Uint16(b[2:4]),
+		Length:   binary.BigEndian.Uint16(b[4:6]),
+		Checksum: binary.BigEndian.Uint16(b[6:8]),
+	}
+	if int(h.Length) > len(b) {
+		h.Payload = b[8:]
+	} else {
+		h.Payload = b[8:int(h.Length)]
+	}
+	return h, nil
 }
 
-func NormalizeHexDump(rawHex string) string {
-	rawHex = strings.ReplaceAll(rawHex, "\n", "")
-	rawHex = strings.ReplaceAll(rawHex, " ", "")
-	return rawHex
+func ParseTCPHeader(b []byte) (*TCPHeader, error) {
+	if len(b) < 20 {
+		return nil, ErrTooShort
+	}
+	hdrLen := (b[12] >> 4) * 4
+	if len(b) < int(hdrLen) {
+		hdrLen = 20
+	}
+	t := &TCPHeader{
+		SrcPort:    binary.BigEndian.Uint16(b[0:2]),
+		DstPort:    binary.BigEndian.Uint16(b[2:4]),
+		Seq:        binary.BigEndian.Uint32(b[4:8]),
+		Ack:        binary.BigEndian.Uint32(b[8:12]),
+		DataOffset: b[12] >> 4,
+		Flags:      binary.BigEndian.Uint16([]byte{0, b[13]}),
+		Window:     binary.BigEndian.Uint16(b[14:16]),
+		Checksum:   binary.BigEndian.Uint16(b[16:18]),
+		Urgent:     binary.BigEndian.Uint16(b[18:20]),
+	}
+	if int(hdrLen) > len(b) {
+		t.Payload = []byte{}
+	} else {
+		t.Payload = b[hdrLen:]
+	}
+	return t, nil
 }
 
-func main() {
+func ParseICMPHeader(b []byte) (*ICMPHeader, error) {
+	if len(b) < 4 {
+		return nil, ErrTooShort
+	}
+	h := &ICMPHeader{
+		Type:     b[0],
+		Code:     b[1],
+		Checksum: binary.BigEndian.Uint16(b[2:4]),
+	}
+	if len(b) > 4 {
+		h.Rest = b[4:]
+	}
+	return h, nil
+}
 
-	rawHex := "" +
-		`ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 
-05 94 00 00 00 00 32 ff be 11 c0 a8 ff 01 c0 a8 
-ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 
-45 00 05 72 00 00 00 00 32 ff b8 33 c0 a8 ff 01 
-c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 
-08 00 45 00 05 50 00 00 00 00 32 ff b8 55 c0 a8 
-ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc 
-dd ee 08 00 45 00 05 2e 00 00 00 00 32 ff b8 77 
-c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa 
-bb cc dd ee 08 00 45 00 05 0c 00 00 00 00 32 ff 
-b8 99 c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 
-00 aa bb cc dd ee 08 00 45 00 04 ea 00 00 00 00 
-32 ff bd bb c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff 
-ff ff 00 aa bb cc dd ee 08 00 45 00 04 c8 00 00 
-00 00 32 ff bd dd c0 a8 ff 01 c0 a8 ff 0a ff ff 
-ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 04 a6 
-00 00 00 00 32 ff bd ff c0 a8 ff 01 c0 a8 ff 0a 
-ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 
-04 84 00 00 00 00 32 ff be 21 c0 a8 ff 01 c0 a8 
-ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 
-45 00 04 62 00 00 00 00 32 ff b9 43 c0 a8 ff 01 
-c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 
-08 00 45 00 04 40 00 00 00 00 32 ff b9 65 c0 a8 
-ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc 
-dd ee 08 00 45 00 04 1e 00 00 00 00 32 ff b9 87 
-c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa 
-bb cc dd ee 08 00 45 00 03 fc 00 00 00 00 32 ff 
-bd a9 c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 
-00 aa bb cc dd ee 08 00 45 00 03 da 00 00 00 00 
-32 ff bd cb c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff 
-ff ff 00 aa bb cc dd ee 08 00 45 00 03 b8 00 00 
-00 00 32 ff bd ed c0 a8 ff 01 c0 a8 ff 0a ff ff 
-ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 03 96 
-00 00 00 00 32 ff be 0f c0 a8 ff 01 c0 a8 ff 0a 
-ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 
-03 74 00 00 00 00 32 ff ba 31 c0 a8 ff 01 c0 a8 
-ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 
-45 00 03 52 00 00 00 00 32 ff ba 53 c0 a8 ff 01 
-c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 
-08 00 45 00 03 30 00 00 00 00 32 ff ba 75 c0 a8 
-ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc 
-dd ee 08 00 45 00 03 0e 00 00 00 00 32 ff ba 97 
-c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa 
-bb cc dd ee 08 00 45 00 02 ec 00 00 00 00 32 ff 
-bd b9 c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 
-00 aa bb cc dd ee 08 00 45 00 02 ca 00 00 00 00 
-32 ff bd db c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff 
-ff ff 00 aa bb cc dd ee 08 00 45 00 02 a8 00 00 
-00 00 32 ff bd fd c0 a8 ff 01 c0 a8 ff 0a ff ff 
-ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 02 86 
-00 00 00 00 32 ff be 1f c0 a8 ff 01 c0 a8 ff 0a 
-ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 
-02 64 00 00 00 00 32 ff bb 41 c0 a8 ff 01 c0 a8 
-ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 
-45 00 02 42 00 00 00 00 32 ff bb 63 c0 a8 ff 01 
-c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 
-08 00 45 00 02 20 00 00 00 00 32 ff bb 85 c0 a8 
-ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc 
-dd ee 08 00 45 00 01 fe 00 00 00 00 32 ff bd a7 
-c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa 
-bb cc dd ee 08 00 45 00 01 dc 00 00 00 00 32 ff 
-bd c9 c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 
-00 aa bb cc dd ee 08 00 45 00 01 ba 00 00 00 00 
-32 ff bd eb c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff 
-ff ff 00 aa bb cc dd ee 08 00 45 00 01 98 00 00 
-00 00 32 ff be 0d c0 a8 ff 01 c0 a8 ff 0a ff ff 
-ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 01 76 
-00 00 00 00 32 ff bc 2f c0 a8 ff 01 c0 a8 ff 0a 
-ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 
-01 54 00 00 00 00 32 ff bc 51 c0 a8 ff 01 c0 a8 
-ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 
-45 00 01 32 00 00 00 00 32 ff bc 73 c0 a8 ff 01 
-c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc dd ee 
-08 00 45 00 01 10 00 00 00 00 32 ff bc 95 c0 a8 
-ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa bb cc 
-dd ee 08 00 45 00 00 ee 00 00 00 00 32 ff bd b7 
-c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 00 aa 
-bb cc dd ee 08 00 45 00 00 cc 00 00 00 00 32 ff 
-bd d9 c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff ff ff 
-00 aa bb cc dd ee 08 00 45 00 00 aa 00 00 00 00 
-32 ff bd fb c0 a8 ff 01 c0 a8 ff 0a ff ff ff ff 
-ff ff 00 aa bb cc dd ee 08 00 45 00 00 88 00 00 
-00 00 32 ff be 1d c0 a8 ff 01 c0 a8 ff 0a ff ff 
-ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 00 66 
-00 00 00 00 32 ff bd 3f c0 a8 ff 01 c0 a8 ff 0a 
-ff ff ff ff ff ff 00 aa bb cc dd ee 08 00 45 00 
-00 44 00 00 00 00 32 ff bd 61 c0 a8 ff 01 c0 a8 
-ff 0a 60 00 00 00 00 08 3a ff fe 80 00 00 00 00 
-00 00 2e e0 82 c6 2c 5c 74 32 ff 02 00 00 00 00 
-00 00 00 00 00 00 00 00 00 02 85 00 2b 02 00 00 
-00 00 
-`
+func ParsePacket(raw []byte) (*Packet, error) {
+	p := &Packet{
+		Timestamp: time.Now(),
+		Raw:       raw,
+	}
 
-	normalizedHex := NormalizeHexDump(rawHex)
+	// windows loopback header
+	if len(raw) >= 4 && raw[0] == 0x02 && raw[1] == 0x00 && raw[2] == 0x00 && raw[3] == 0x00 {
+		ip := raw[4:] // pula o cabeçalho loopback
 
-	data, err := hex.DecodeString(normalizedHex)
+		// só aceita IPv4
+		if len(ip) > 0 && (ip[0]>>4) == 4 {
+			if _, err := ParseIPv4(ip, p); err == nil {
+				parseTransport(p)
+				return p, nil
+			}
+		}
+	}
+
+	// ethernet
+	off, err := ParseEthernet(raw, p)
 	if err != nil {
-		log.Fatal("Erro ao decodificar hex: ", err)
+		return nil, err
 	}
 
-	// Parse
-	eth, afterEth := ParseEthernetFrame(data)
-	ip, afterIP := ParseIPv4Packet(afterEth)
-	udp := ParseUDP(ip.Payload)
+	if len(raw) <= off {
+		return p, nil
+	}
 
-	// ---------------------------
-	// OUTPUT
-	// ---------------------------
+	if p.EtherType == 0x0800 {
+		if _, err := ParseIPv4(raw[off:], p); err == nil {
+			parseTransport(p)
+		}
+	}
 
-	fmt.Println("========== PARSER ==========")
+	return p, nil
+}
 
-	fmt.Println("\n---- Ethernet ----")
-	fmt.Println("Dst MAC:", formatMACBytes(eth.DestinationMAC))
-	fmt.Println("Src MAC:", formatMACBytes(eth.SourceMAC))
-	fmt.Printf("EtherType: 0x%04x\n", eth.EtherType)
+func parseTransport(p *Packet) {
+	ipPay := p.IPv4.Payload
 
-	fmt.Println("\n---- IPv4 ----")
-	fmt.Println("Version:", ip.Version)
-	fmt.Println("IHL:", ip.IHL)
-	fmt.Println("Total Length:", ip.TotalLength)
-	fmt.Println("Protocol:", ip.Protocol, "(11 = UDP)")
-	fmt.Println("Src IP:", ip.SourceIP)
-	fmt.Println("Dst IP:", ip.DestinationIP)
-
-	fmt.Println("\n---- UDP ----")
-	fmt.Println("Src Port:", udp.SourcePort)
-	fmt.Println("Dst Port:", udp.DestinationPort)
-	fmt.Println("Length:", udp.Length)
-	fmt.Println("Checksum:", fmt.Sprintf("0x%04x", udp.Checksum))
-
-	fmt.Println("\n---- UDP Payload (raw hex) ----")
-	fmt.Println(hex.EncodeToString(ip.Payload[8:]))
-
-	fmt.Println("\n(OBS: payload ainda não está sendo interpretado)")
-	_ = afterIP // apenas para evitar unused
+	switch p.IPv4.Protocol {
+	case 6: // tcp
+		if tcp, err := ParseTCPHeader(ipPay); err == nil {
+			p.TCP = tcp
+		}
+	case 17: // udp
+		if udp, err := ParseUDPHeader(ipPay); err == nil {
+			p.UDP = udp
+		}
+	case 1: // icmp
+		if icmp, err := ParseICMPHeader(ipPay); err == nil {
+			p.ICMP = icmp
+		}
+	}
 }
