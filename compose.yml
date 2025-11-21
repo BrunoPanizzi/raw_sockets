@@ -1,0 +1,24 @@
+services:
+  server:
+    image: ghcr.io/sjohann81/labredes:latest
+    privileged: true
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./traffic_tunnel/server:/home
+
+  client_1:
+    image: ghcr.io/sjohann81/labredes:latest
+    privileged: true
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./traffic_tunnel/client_1:/home
+
+  client_2:
+    image: ghcr.io/sjohann81/labredes:latest
+    privileged: true
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./traffic_tunnel/client_2:/home
