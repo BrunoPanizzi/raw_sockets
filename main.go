@@ -77,11 +77,11 @@ func main() {
 
 		for {
 			data, _, err := handle.ReadPacketData()
-			log.Printf("PACOTE RECEBIDO TAM: %d | HEX: % X", len(data), data[:min(32, len(data))])
-			chRawPackets <- data
-			if err == nil {
-				chRawPackets <- data
+			if err != nil {
+				continue
 			}
+			log.Printf("PACOTE CAPTURADO: TAM: %d | HEX: % X", len(data), data[:min(32, len(data))])
+			chRawPackets <- data
 		}
 	}()
 
